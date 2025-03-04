@@ -1,102 +1,83 @@
-import argparse
-import curses
-import logging
-import os
-import signal
-import threading
-import time
+'''
+Date: 2024.02.09
+Update: change image save
+    the number and name of all the file in image folder are same
+'''
 
-import bosdyn.api.power_pb2 as PowerServiceProto
-import bosdyn.api.robot_state_pb2 as robot_state_proto
 import bosdyn.client.util
-from bosdyn.api import arm_command_pb2, geometry_pb2, robot_command_pb2, synchronized_command_pb2
-from bosdyn.client import ResponseError, RpcError, create_standard_sdk
-from bosdyn.client.async_tasks import AsyncPeriodicQuery, AsyncPeriodicGRPCTask
-from bosdyn.client.estop import EstopClient, EstopEndpoint, EstopKeepAlive
-from bosdyn.client.lease import Error as LeaseBaseError
-from bosdyn.client.lease import LeaseClient, LeaseKeepAlive
-from bosdyn.client.power import PowerClient
-from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient
-from bosdyn.client.robot_state import RobotStateClient
-from bosdyn.client.time_sync import TimeSyncError
-from bosdyn.util import duration_str, format_metric, secs_to_hms
+from bosdyn.client.async_tasks import  AsyncPeriodicGRPCTask
 from bosdyn.geometry import EulerZXY
 import pickle
 import curses
 import io
 import logging
-import math
-import os
 import signal
-import sys
 import threading
-import time
-from collections import OrderedDict
-
-from PIL import Image, ImageEnhance
-
-import bosdyn.api.basic_command_pb2 as basic_command_pb2
+from PIL import Image
 import bosdyn.api.power_pb2 as PowerServiceProto
-# import bosdyn.api.robot_command_pb2 as robot_command_pb2
 import bosdyn.api.robot_state_pb2 as robot_state_proto
-import bosdyn.api.spot.robot_command_pb2 as spot_command_pb2
-import bosdyn.client.util
-from bosdyn.api import geometry_pb2
 from bosdyn.client import ResponseError, RpcError, create_standard_sdk
 from bosdyn.client.async_tasks import AsyncGRPCTask, AsyncPeriodicQuery, AsyncTasks
-from bosdyn.client.estop import EstopClient, EstopEndpoint, EstopKeepAlive
-from bosdyn.client.frame_helpers import ODOM_FRAME_NAME,VISION_FRAME_NAME,BODY_FRAME_NAME,HAND_FRAME_NAME, get_a_tform_b
-from bosdyn.client.image import ImageClient
+from bosdyn.client.estop import  EstopEndpoint, EstopKeepAlive
+from bosdyn.client.frame_helpers import (GROUND_PLANE_FRAME_NAME, VISION_FRAME_NAME, BODY_FRAME_NAME,HAND_FRAME_NAME,
+                                         get_a_tform_b, get_vision_tform_body)
+from bosdyn.client import math_helpers
+
 from bosdyn.client.lease import Error as LeaseBaseError
 from bosdyn.client.lease import LeaseClient, LeaseKeepAlive
 from bosdyn.client.power import PowerClient
-from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient
-from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.time_sync import TimeSyncError
-from bosdyn.util import duration_str, format_metric, secs_to_hms
-from bosdyn.client import math_helpers
-import argparse
-import sys
-import time
-
-from google.protobuf import wrappers_pb2
+from bosdyn.util import duration_str, secs_to_hms
 
 import bosdyn.client
 import bosdyn.client.estop
 import bosdyn.client.lease
 import bosdyn.client.util
-from bosdyn.api import arm_command_pb2, estop_pb2, robot_command_pb2, synchronized_command_pb2
+from bosdyn.api import arm_command_pb2, geometry_pb2, robot_command_pb2, image_pb2, manipulation_api_pb2
 from bosdyn.client.estop import EstopClient
-from bosdyn.client.robot_command import (RobotCommandBuilder, RobotCommandClient,
-                                         block_until_arm_arrives, blocking_stand, blocking_sit)
+from bosdyn.client.robot_command import (RobotCommandBuilder, RobotCommandClient,)
 from bosdyn.client.robot_state import RobotStateClient
-from bosdyn.util import duration_to_seconds
 
 import traceback
 from datetime import datetime
-import os, errno
-
+import os
 import numpy as np   
-
-###############
-#from offline_planner import *
-
+import time
+from scipy import ndimage
+from bosdyn.client.image import ImageClient
+from bosdyn.api.image_pb2 import ImageSource
+from bosdyn.client.manipulation_api_client import ManipulationApiClient
+import torch
+import utils as u
+import ImageProcess as imgutil
+import cv2
 LOGGER = logging.getLogger(__name__)
+
+path = '/home/carol/Project/Spot/grasp_in_image/Spot-Reach-v0/102/reach'
+#/home/carol/Project/Spot/grasp_in_image/Spot-Reach-v0/102/reach_afford_new/final_ddqn.pth
+afford=True
+prior=True
+model='_new/final_ddqn.pth'
+if prior:
+    model ='_prior'+model
+if afford:
+    model = '_afford' + model
+load_path = path+model
+from DQN_play import DDQN
+agent = DDQN(
+    afford=afford,
+    prior=prior,
+)
+agent.load_model(path=load_path)
 
 
 # Logs name
 # datetime object containing current date and time
 # dd/mm/YY H:M:S
 dt_string = datetime.now().strftime("%d-%m-%Y-%H-%M-%S")
-ACTION_LOG_PATH='logs-wall/'+dt_string+'/'
-STATE_LOG_PATH='logs-wall/'+dt_string+'/'
-ARM_LOG_PATH='logs-wall/'+dt_string+'/arms/' 
-IMG_LOG_PATH='logs-wall/'+dt_string+'/image/'
-
-
-os.makedirs(ACTION_LOG_PATH)
-os.makedirs(IMG_LOG_PATH, exist_ok=True)
-os.makedirs(ARM_LOG_PATH, exist_ok=True)
+base_path = 'logs-aff/'+dt_string+'/'+model.split('/')[0]
+STATE_LOG_PATH=base_path+'/state/'
+os.makedirs(STATE_LOG_PATH, exist_ok=True)
 
 
 UNLOCK=False # if False to lock the arm movement in world coordinates
@@ -115,38 +96,19 @@ VELOCITY_ANGULAR_HAND = 1.0  # rad/sec
 PREV_IMG = None
 PREV_STATE = None
 
-def _image_to_ascii(image, new_width):
-    """Convert an rgb image to an ASCII 'image' that can be displayed in a terminal."""
+# Mapping from visual to depth data
+VISUAL_SOURCE_TO_DEPTH_MAP_SOURCE = {
+    'frontleft_fisheye_image': 'frontleft_depth_in_visual_frame',
+    'frontright_fisheye_image': 'frontright_depth_in_visual_frame'
+}
+ROTATION_ANGLES = {
+    'back_fisheye_image': 0,
+    'frontleft_fisheye_image': -78,
+    'frontright_fisheye_image': -102,
+    'left_fisheye_image': 0,
+    'right_fisheye_image': 180
+}
 
-    ASCII_CHARS = '@#S%?*+;:,.'
-
-    enhancer = ImageEnhance.Contrast(image)
-    image = enhancer.enhance(0.8)
-
-    # Scaling image before rotation by 90 deg.
-    scaled_rot_height = new_width
-    original_rot_width, original_rot_height = image.size
-    scaled_rot_width = (original_rot_width * scaled_rot_height) // original_rot_height
-    # Scaling rotated width (height, after rotation) by half because ASCII chars
-    #  in terminal seem about 2x as tall as wide.
-    image = image.resize((scaled_rot_width // 2, scaled_rot_height))
-
-    # Rotate image 90 degrees, then convert to grayscale.
-    image = image.transpose(Image.ROTATE_270)
-    image = image.convert('L')
-
-    def _pixel_char(pixel_val):
-        return ASCII_CHARS[pixel_val * len(ASCII_CHARS) // 256]
-
-    img = []
-    row = [' '] * new_width
-    last_col = new_width - 1
-    for idx, pixel_char in enumerate(_pixel_char(val) for val in image.getdata()):
-        idx_row = idx % new_width
-        row[idx_row] = pixel_char
-        if idx_row == last_col:
-            img.append(''.join(row))
-    return img
 
 class ExitCheck(object):
     """A class to help exiting a loop, also capturing SIGTERM to exit the loop."""
@@ -195,7 +157,6 @@ class AsyncRobotState(AsyncPeriodicQuery):
 
     def _start_query(self):
         return self._client.get_robot_state_async()
-
 class AsyncArmStateCapture(AsyncPeriodicQuery):
 
     def __init__(self, robot_state_client):
@@ -213,18 +174,11 @@ class AsyncArmStateCapture(AsyncPeriodicQuery):
             #timestamp = result.kinematic_state.acquisition_timestamp.seconds + \
             #            result.kinematic_state.acquisition_timestamp.nanos * 1e-9
             timestamp = "%.20f" % time.time()
-            arm_joint_states = []
-            for joint in result.kinematic_state.joint_states:
-                if 'arm' in joint.name:
-                    arm_joint_states.append(joint)
-            if arm_joint_states[2] ==0:
-                arm_joint_states = np.delete(arm_joint_states, 2)
-                print('deteleted 0')
 
-            arm_filename = ARM_LOG_PATH + str(timestamp)+'.pkl'
+            arm_filename = STATE_LOG_PATH + str(timestamp)+'.pkl'
 
             with open(arm_filename, 'wb') as f:
-                pickle.dump(arm_joint_states, f)
+                pickle.dump(result, f)
 
         except Exception as e:
             LOGGER.exception('Error saving the image: %s', e)
@@ -232,66 +186,17 @@ class AsyncArmStateCapture(AsyncPeriodicQuery):
     def _handle_error(self, exception):
         LOGGER.exception('Failure getting image: %s', exception)
 
-
-class AsyncImageCapture(AsyncPeriodicGRPCTask):
+class Image_Process():
     """Grab camera images from the robot."""
 
-    def __init__(self, robot, source_name, save_mode):
-        super(AsyncImageCapture, self).__init__(period_sec=0.0001)
-        self._image_client = robot.ensure_client(ImageClient.default_service_name)
-        self._ascii_image = None
-        self._video_mode = False
-        self._should_take_image = False
-        self.source_name = source_name
-        self.save_mode = save_mode
+    def __init__(self, encode_flag=True,sgm_flag=True):
+        if encode_flag:
+            self.encoder = imgutil.DinoProcessor()
+        if sgm_flag:
+            self.segmentor = imgutil.SamProcessor()
+        self.encode_flag = encode_flag
+        self.sgm_flag = sgm_flag
 
-    @property
-    def ascii_image(self):
-        """Return the latest captured image as ascii."""
-        return self._ascii_image
-
-    def toggle_video_mode(self):
-        """Toggle whether doing continuous image capture."""
-        self._video_mode = not self._video_mode
-
-    def take_image(self):
-        """Request a one-shot image."""
-        self._should_take_image = not self._should_take_image
-
-    def _start_query(self):
-        source_name = self.source_name 
-        return self._image_client.get_image_from_sources_async([source_name])
-
-    def _should_query(self, now_sec):  # pylint: disable=unused-argument
-        return (self._video_mode or self._should_take_image) and (now_sec - self._last_call) > self._period_sec
-
-    def _handle_result(self, result):
-        try:
-            mydir = os.path.join(
-                            IMG_LOG_PATH, self.source_name) 
-            isExist = os.path.exists(mydir)
-            if not isExist:
-                os.makedirs(mydir)
-            imageFileName = "%.20f" % time.time() #datetime.now().strftime('%Y-%m-%d_%H-%M-%S-%f')[:-3]
-            image = []
-            if(self.save_mode == 1):
-                image = Image.open(io.BytesIO(result[0].shot.image.data))
-            else:
-                image = np.frombuffer(result[0].shot.image.data, dtype=np.uint16)
-                image = image.reshape(result[0].shot.image.rows,
-                                            result[0].shot.image.cols)
-                image = Image.fromarray(image)
-
-            image = image.save(os.path.join(mydir,imageFileName + '.png'))
-
-            global PREV_IMG
-            PREV_IMG = image
-
-        except Exception as e:
-            LOGGER.exception('Error saving the image: %s', e)
-
-    def _handle_error(self, exception):
-        LOGGER.exception('Failure getting image: %s', exception)
 
 
 class WasdInterface(object):
@@ -309,66 +214,49 @@ class WasdInterface(object):
             self._estop_client = None
             self._estop_endpoint = None
         self._power_client = robot.ensure_client(PowerClient.default_service_name)
+
         self._robot_state_client = robot.ensure_client(RobotStateClient.default_service_name)
-        self._robot_command_client = robot.ensure_client(RobotCommandClient.default_service_name)
         self._robot_state_task = AsyncRobotState(self._robot_state_client)
-        #['frontright_fisheye_image', 'frontleft_fisheye_image', 'frontright_depth', 'frontleft_depth']
-        self._image_task_frontright_image = AsyncImageCapture(robot, 'frontright_fisheye_image', 1) #TODO : Change to constant or do something
-        self._image_task_frontleft_image = AsyncImageCapture(robot, 'frontleft_fisheye_image', 1)
-        self._image_task_frontright_depth = AsyncImageCapture(robot, 'frontright_depth_in_visual_frame', 2)
-        self._image_task_frontleft_depth = AsyncImageCapture(robot, 'frontleft_depth_in_visual_frame', 2)
+        self._robot_command_client = robot.ensure_client(RobotCommandClient.default_service_name)
+        self._robot_mani_client = robot.ensure_client(ManipulationApiClient.default_service_name)
         self._arm_log_task = AsyncArmStateCapture(self._robot_state_client)
-        self._async_tasks = AsyncTasks([self._robot_state_task, 
+        #['frontright_fisheye_image', 'frontleft_fisheye_image', 'frontright_depth', 'frontleft_depth']
+        self._image_client = robot.ensure_client(ImageClient.default_service_name)
+        self._async_tasks = AsyncTasks([self._robot_state_task,
                                         self._arm_log_task,
-                                        self._image_task_frontright_image,
-                                        self._image_task_frontleft_image, 
-                                        self._image_task_frontright_depth, 
-                                        self._image_task_frontleft_depth])
+                                        #self._image_task
+                                        ])
+
+        self.image_source = ['frontright_fisheye_image']
+        depth_source = VISUAL_SOURCE_TO_DEPTH_MAP_SOURCE[self.image_source[0]]
+        self.image_source.append(depth_source)
+        self.image=None
+        self.grasp_position = None
+        self.imgprocessor=Image_Process(encode_flag=True,sgm_flag=True)
+
+
         self._lock = threading.Lock()
         self._command_dictionary = {
             27: self._stop,  # ESC key
             ord('\t'): self._quit_program,
-            ord('x'): self._toggle_time_sync,
             ord(' '): self._toggle_estop,
-            ord('r'): self._self_right,
-            ord('P'): self._toggle_power,
             ord('p'): self._toggle_power,
             ord('c'): self._sit,
-            ord('b'): self._battery_change_pose,
             ord('f'): self._stand,
             ord('w'): self._move_forward,
             ord('s'): self._move_backward,
             ord('a'): self._strafe_left,
             ord('d'): self._strafe_right,
-            ord('W'): self._arm_cartesian_move_out,
-            ord('S'): self._arm_cartesian_move_in,
-            ord('A'): self._rotate_cartesian_ccw,
-            ord('D'): self._rotate_cartesian_cw,
-            ord('R'): self._move_up,
-            ord('F'): self._move_down,
-            ord('I'): self._rotate_plus_ry,
-            ord('K'): self._rotate_minus_ry,
-            ord('U'): self._rotate_plus_rx,
-            ord('O'): self._rotate_minus_rx,
-            ord('J'): self._rotate_plus_rz,
-            ord('L'): self._rotate_minus_rz,
             ord('N'): self._toggle_gripper_open,
             ord('M'): self._toggle_gripper_closed,
             ord('q'): self._turn_left,
             ord('e'): self._turn_right,
-            ord('i'): self._toggle_image_capture,
+            #ord('i'): self._toggle_image_capture,
             ord('y'): self._unstow,
             ord('h'): self._stow,
-            ord('l'): self._toggle_lease,
-            ord('G'): self._body_pitch_down,
-            ord('T'): self._body_pitch_up,
-            ord('V'): self._reset_height,
-            ord('1'): self._move_arm_position,# self._body_yaw_left,
-            ord('2'): self._body_yaw_right,
-            ord('9'): self.reset_LOCK,
-            ord('0'): self.reset_UNLOCK,
-            ord('.'): self.reset_AI_CONTROL, 
-            ord(','): self.reset_HUMAN_CONTROL
+            ord('v'): self._show_image_grasp,
+            ord('k'): self._grasp_from_agent,
+            ord('.'): self.reset_AI_CONTROL,
             
         }
         self._locked_messages = ['', '', '']  # string: displayed message for user
@@ -378,13 +266,6 @@ class WasdInterface(object):
         # Stuff that is set in start()
         self._robot_id = None
         self._lease_keepalive = None
-
-        self.action_handler_logger = self._setup_file_logger(loggerName="action_logger",fileName=ACTION_LOG_PATH+"action_log.log")
-        self.robot_state_handler_logger = self._setup_file_logger(loggerName="robot_state_logger",fileName=STATE_LOG_PATH+"robot_state_log.log")
-
-        # initialize the offline planner
-        #self.planner = OfflinePlanner()
-        self.ai_image_client = robot.ensure_client(ImageClient.default_service_name)
 
 
     def start(self):
@@ -457,6 +338,7 @@ class WasdInterface(object):
                             cmd = stdscr.getch()
                             # Do not queue up commands on client
                             self.flush_and_estop_buffer(stdscr)
+                            LOGGER.info(f'action is{stdscr}')
                             self._drive_cmd(cmd)
                             time.sleep(COMMAND_INPUT_RATE)
                         except Exception:
@@ -467,42 +349,7 @@ class WasdInterface(object):
                             raise
                     else:
                         try:
-                            # Get the robot state
-                            '''
-                            robot_state = state_client.get_robot_state()
-
-                            # If the robot has an arm, the arm state will be present.
-                            # Extract the arm joint states if available.
-                            if robot_state.HasField('arm_state'):
-                                arm_joint_states = robot_state.arm_state.joint_states
-                                for joint_state in arm_joint_states:
-                                    print(f"Joint {joint_state.name}: Position = {joint_state.position}, Velocity = {joint_state.velocity}")
-                            else:
-                                print("Robot does not have an arm or the arm state is not available.")
-                            '''
-
                             state = self._robot_state_client.get_robot_state()
-                            arm = []
-                            for joint_state in state.kinematic_state.joint_states:
-                                if 'arm' in joint_state.name:
-                                    arm.append(joint_state.position.value)
-
-                            cam_names = ['frontleft_fisheye_image', 'frontright_fisheye_image']
-                            im_res = self.ai_image_client.get_image_from_sources(cam_names)
-                            image_l = Image.open(io.BytesIO(im_res[0].shot.image.data)).convert('RGB')
-                            image_r = Image.open(io.BytesIO(im_res[1].shot.image.data)).convert('RGB')
-
-                            cmds, _ = [],[]#self.planner.plan_pred([image_l, image_r], arm)
-                            #AI_CONTROL = ai_control
-                            #print(cmds)
-                            for cm in cmds[:2]:
-                                # Do not queue up commands on client
-                                #print(cm)
-                                for i in range(2):
-                                    #print(cm)
-                                    self.flush_and_estop_buffer(stdscr)
-                                    self._drive_cmd(ord(cm))
-                                    time.sleep(COMMAND_INPUT_RATE)
                         except Exception:
                             # On robot command fault, sit down safely before killing the program.
                             print(traceback.format_exc())
@@ -526,22 +373,18 @@ class WasdInterface(object):
         stdscr.addstr(5, 0, self._time_sync_str())
         for i in range(3):
             stdscr.addstr(7 + i, 2, self.message(i))
-        stdscr.addstr(10, 0, 'Commands: [TAB]: quit                                  ')
-        stdscr.addstr(11, 0, '          [T]: Time-sync, [SPACE]: Estop, [P]: Power   ')
-        stdscr.addstr(12, 0, '          [i]: Take image , [O]: Video mode N/A            ')
-        stdscr.addstr(13, 0, '          [f]: Stand, [r]: Self-right                  ')
-        stdscr.addstr(14, 0, '          [c]: Sit, [b]: Battery-change                ')
-        stdscr.addstr(15, 0, '          [y]: Unstow arm, [h]: Stow arm               ')
-        stdscr.addstr(16, 0, '          [wasd]: Directional strafing                 ')
-        stdscr.addstr(17, 0, '          [WASD]: Arm Radial/Azimuthal control         ')
-        stdscr.addstr(18, 0, '          [RF]: Up/Down control         ')
-        stdscr.addstr(19, 0, '          [UO]: X-axis rotation control             ')
-        stdscr.addstr(20, 0, '          [IK]: Y-axis rotation control             ')
-        stdscr.addstr(21, 0, '          [JL]: Z-axis rotation control             ')
-        stdscr.addstr(22, 0, '          [NM]: Open/Close gripper                  ')
-        stdscr.addstr(23, 0, '          [qe]: Body Turning, [ESC]: Stop                   ') 
-        stdscr.addstr(24, 0, '          [l]: Return/Acquire lease                  ')
-        stdscr.addstr(25, 0, '')   
+        stdscr.addstr(10, 0, '          Commands: [TAB]: quit                                  ')
+        stdscr.addstr(11, 0, '          [i]: Take image and show')
+        stdscr.addstr(12, 0, '          [f]: Stand,                ')
+        stdscr.addstr(13, 0, '          [c]: Sit,                ')
+        stdscr.addstr(14, 0, '          [y]: Unstow arm, [h]: Stow arm               ')
+        stdscr.addstr(15, 0, '          [wasd]: Directional strafing                 ')
+        stdscr.addstr(16, 0, '          [NM]: Open/Close gripper                  ')
+        stdscr.addstr(17, 0, '          [qe]: Body Turning, [ESC]: Stop                   ')
+        stdscr.addstr(18, 0, '          [l]: Return/Acquire lease                  ')
+        stdscr.addstr(19, 0, '          [v],show mask of the image')
+        stdscr.addstr(20, 0, '          [m],detect the target and move to it automatically')
+
 
         global AI_CONTROL
         global UNLOCK
@@ -555,17 +398,7 @@ class WasdInterface(object):
         if UNLOCK:
             stdscr.addstr(27, 0, 'Now hand is unlocked in space')
         else:
-            stdscr.addstr(27, 0, 'Now hand is locked in space')   
-
-
-        # print as many lines of the image as will fit on the curses screen
-        '''if self._image_task.ascii_image != None:
-                                    max_y, _max_x = stdscr.getmaxyx()
-                                    for y_i, img_line in enumerate(self._image_task.ascii_image):
-                                        if y_i + 17 >= max_y:
-                                            break
-                        
-                                        stdscr.addstr(y_i + 17, 0, img_line)'''
+            stdscr.addstr(27, 0, 'Now hand is locked in space')
 
         stdscr.refresh()
 
@@ -573,9 +406,6 @@ class WasdInterface(object):
         """Run user commands at each update."""
         try:
             cmd_function = self._command_dictionary[key]
-            if(key not in [ord(' '), ord('\t')]):
-                act_info = "%.20f" % time.time() + '-' + chr(key) 
-                self.action_handler_logger.info(act_info)
             cmd_function()
 
         except KeyError:
@@ -585,7 +415,8 @@ class WasdInterface(object):
     def _try_grpc(self, desc, thunk):
         try:
             cmd_id = thunk()
-            self.robot_state_handler_logger.info(self.robot_state)
+            state = self._robot_state_client.get_robot_state
+            #self.robot_state_handler_logger.info(state)
             return cmd_id
         except (ResponseError, RpcError, LeaseBaseError) as err:
             self.add_message(f'Failed {desc}: {err}')
@@ -608,11 +439,6 @@ class WasdInterface(object):
         if self._exit_check is not None:
             self._exit_check.request_exit()
 
-    def _toggle_time_sync(self):
-        if self._robot.time_sync.stopped:
-            self._robot.start_time_sync()
-        else:
-            self._robot.time_sync.stop()
 
     def _toggle_estop(self):
         """toggle estop on/off. Initial state is ON"""
@@ -623,12 +449,6 @@ class WasdInterface(object):
                 self._try_grpc('stopping estop', self._estop_keepalive.stop)
                 self._estop_keepalive.shutdown()
                 self._estop_keepalive = None
-
-    def _toggle_image_capture(self):
-        self._image_task_frontright_image.take_image()
-        self._image_task_frontleft_image.take_image()
-        self._image_task_frontright_depth.take_image()
-        self._image_task_frontleft_depth.take_image()
 
     def _toggle_lease(self):
         """toggle lease acquisition. Initial state is acquired"""
@@ -648,24 +468,13 @@ class WasdInterface(object):
 
         return self._try_grpc(desc, _start_command)
 
-    def _self_right(self):
-        self._start_robot_command('self_right', RobotCommandBuilder.selfright_command())
-
-    def _battery_change_pose(self):
-        # Default HINT_RIGHT, maybe add option to choose direction?
-        self._start_robot_command(
-            'battery_change_pose',
-            RobotCommandBuilder.battery_change_pose_command(
-                dir_hint=basic_command_pb2.BatteryChangePoseCommand.Request.HINT_RIGHT))
 
     def _sit(self):
         self._start_robot_command('sit', RobotCommandBuilder.synchro_sit_command())
 
     def _stand(self):
         self._start_robot_command('stand', RobotCommandBuilder.synchro_stand_command())
-        #self._start_robot_command('open_gripper', RobotCommandBuilder.claw_gripper_open_command())
-        self._toggle_image_capture()
-        self._move_arm_position()
+        #self._toggle_image_capture()
 
 
     def _move_forward(self):
@@ -696,42 +505,36 @@ class WasdInterface(object):
         if UNLOCK:
             self._arm_angular_velocity_cmd_helper('rotate_plus_rx', v_rx=VELOCITY_ANGULAR_HAND)
         else:
-            #do something
             self._arm_angular_velocity_cmd_helper_LOCK('rotate_plus_rx', v_rx=VELOCITY_ANGULAR_HAND)
 
     def _rotate_minus_rx(self):
         if UNLOCK:
             self._arm_angular_velocity_cmd_helper('rotate_minus_rx', v_rx=-VELOCITY_ANGULAR_HAND)
         else:
-            #do something
             self._arm_angular_velocity_cmd_helper_LOCK('rotate_minus_rx', v_rx=-VELOCITY_ANGULAR_HAND)
 
     def _rotate_plus_ry(self):
         if UNLOCK:
             self._arm_angular_velocity_cmd_helper('rotate_plus_ry', v_ry=VELOCITY_ANGULAR_HAND)
         else:
-            #do something
             self._arm_angular_velocity_cmd_helper_LOCK('rotate_plus_ry', v_ry=VELOCITY_ANGULAR_HAND)
 
     def _rotate_minus_ry(self):
         if UNLOCK:
             self._arm_angular_velocity_cmd_helper('rotate_minus_ry', v_ry=-VELOCITY_ANGULAR_HAND)
         else:
-            #do something
             self._arm_angular_velocity_cmd_helper_LOCK('rotate_minus_ry', v_ry=-VELOCITY_ANGULAR_HAND)
 
     def _rotate_plus_rz(self):
         if UNLOCK:
             self._arm_angular_velocity_cmd_helper('rotate_plus_rz', v_rz=VELOCITY_ANGULAR_HAND)
         else:
-            #do something
             self._arm_angular_velocity_cmd_helper_LOCK('rotate_plus_rz', v_rz=VELOCITY_ANGULAR_HAND)
 
     def _rotate_minus_rz(self):
         if UNLOCK:
             self._arm_angular_velocity_cmd_helper('rotate_minus_rz', v_rz=-VELOCITY_ANGULAR_HAND)
         else:
-            #do something
             self._arm_angular_velocity_cmd_helper_LOCK('rotate_minus_rz', v_rz=-VELOCITY_ANGULAR_HAND)
 
 
@@ -782,18 +585,6 @@ class WasdInterface(object):
     def _toggle_gripper_closed(self):
         self._start_robot_command('close_gripper', RobotCommandBuilder.claw_gripper_close_command())
 
-    def _body_pitch_up(self):
-        self._orientation_cmd_helper(pitch=0.1)
-
-    def _body_pitch_down(self):
-        self._orientation_cmd_helper(pitch=-0.7)
-
-    def _body_yaw_left(self):
-        self._orientation_cmd_helper(yaw=0.1)
-
-    def _body_yaw_right(self):
-        self._orientation_cmd_helper(yaw=-0.1)
-
 
     def reset_AI_CONTROL(self):
         global AI_CONTROL
@@ -805,19 +596,6 @@ class WasdInterface(object):
         AI_CONTROL = False
 
         print('now Human control')
-
-    def reset_UNLOCK(self):
-        global UNLOCK
-        UNLOCK = True
-
-    def reset_LOCK(self):
-        global UNLOCK
-        UNLOCK = False
-
-    def _reset_height(self):
-        """Resets robot body height to normal stand height.
-        """
-        self._orientation_cmd_helper(height=0.0)
 
 
     def _orientation_cmd_helper(self, yaw=0.0, roll=0.0, pitch=0.0, height=0.0):
@@ -898,84 +676,19 @@ class WasdInterface(object):
 
         """
         # Specify a zero linear velocity of the hand. This can either be in a cylindrical or Cartesian coordinate system.
-        cylindrical_velocity = arm_command_pb2.ArmVelocityCommand.CartesianVelocity(frame_name = "body")
+        cartesian_velocity = arm_command_pb2.ArmVelocityCommand.CartesianVelocity(frame_name = "body")
 
         # Build the angular velocity command of the hand
         angular_velocity_of_hand_rt_odom_in_hand = geometry_pb2.Vec3(x=v_rx, y=v_ry, z=v_rz)
 
         arm_velocity_command = arm_command_pb2.ArmVelocityCommand.Request(
-            cartesian_velocity=cylindrical_velocity,
+            cartesian_velocity=cartesian_velocity,
             angular_velocity_of_hand_rt_odom_in_hand=angular_velocity_of_hand_rt_odom_in_hand,
             end_time=self._robot.time_sync.robot_timestamp_from_local_secs(time.time() +
                                                                            VELOCITY_CMD_DURATION))
 
         self._arm_velocity_cmd_helper(arm_velocity_command=arm_velocity_command, desc=desc)
-       
 
-    def make_robot_command(self,arm_joint_traj):
-        """ Helper function to create a RobotCommand from an ArmJointTrajectory.
-            The returned command will be a SynchronizedCommand with an ArmJointMoveCommand
-            filled out to follow the passed in trajectory. """
-
-        joint_move_command = arm_command_pb2.ArmJointMoveCommand.Request(trajectory=arm_joint_traj)
-        arm_command = arm_command_pb2.ArmCommand.Request(arm_joint_move_command=joint_move_command)
-        sync_arm = synchronized_command_pb2.SynchronizedCommand.Request(arm_command=arm_command)
-        arm_sync_robot_cmd = robot_command_pb2.RobotCommand(synchronized_command=sync_arm)
-        return RobotCommandBuilder.build_synchro_command(arm_sync_robot_cmd)
-
-    def _move_by_joint_angle(self):
-        # First point position
-        sh0 = -1.5
-        sh1 = -0.8
-        el0 = 1.7
-        el1 = 0.0
-        wr0 = 0.5
-        wr1 = 0.0
-
-        # First point time (seconds)
-        first_point_t = 2.0
-
-        # Build the proto for the trajectory point.
-        traj_point1 = RobotCommandBuilder.create_arm_joint_trajectory_point(
-            sh0, sh1, el0, el1, wr0, wr1, first_point_t)
-
-        # Second point position
-        sh0 = 1.0
-        sh1 = -0.2
-        el0 = 1.3
-        el1 = -1.3
-        wr0 = -1.5
-        wr1 = 1.5
-
-        # Second point time (seconds)
-        second_point_t = 4.0
-
-        # Build the proto for the second trajectory point.
-        traj_point2 = RobotCommandBuilder.create_arm_joint_trajectory_point(
-            sh0, sh1, el0, el1, wr0, wr1, second_point_t)
-
-        # Optionally, set the maximum allowable velocity in rad/s that a joint is allowed to
-        # travel at. Also set the maximum allowable acceleration in rad/s^2 that a joint is
-        # allowed to accelerate at. If these values are not set, a default will be used on
-        # the robot.
-        # Note that if these values are set too low and the trajectories are too aggressive
-        # in terms of time, the desired joint angles will not be hit at the specified time.
-        # Some other ways to help the robot actually hit the specified trajectory is to
-        # increase the time between trajectory points, or to only specify joint position
-        # goals without specifying velocity goals.
-        max_vel = wrappers_pb2.DoubleValue(value=2.5)
-        max_acc = wrappers_pb2.DoubleValue(value=15)
-
-        # Build up a proto.
-        arm_joint_traj = arm_command_pb2.ArmJointTrajectory(points=[traj_point1, traj_point2],
-                                                            maximum_velocity=max_vel,
-                                                            maximum_acceleration=max_acc)
-        # Make a RobotCommand
-        command = self.make_robot_command(arm_joint_traj)
-
-        # Send the request
-        self._start_robot_command('move_arm_by_joint_angle', command)
-        
 
     def _turn_left(self):
         self._velocity_cmd_helper('turn_left', v_rot=VELOCITY_BASE_ANGULAR)
@@ -988,18 +701,18 @@ class WasdInterface(object):
 
     def _arm_cartesian_velocity_cmd_helper(self, desc, v_x=0.0, v_y=0.0, v_z=0.0):
 
-        cartesian_velocity = arm_command_pb2.ArmVelocityCommand.CartesianVelocity()
-        cartesian_velocity.frame_name = "body"
+        cartesian_velocity = arm_command_pb2.ArmVelocityCommand.CartesianVelocity(frame_name = "body")
         cartesian_velocity.velocity_in_frame_name.x = v_x
         cartesian_velocity.velocity_in_frame_name.y = v_y
         cartesian_velocity.velocity_in_frame_name.z = v_z
+        #LOGGER.info(cartesian_velocity.frame_name)
 
         arm_velocity_command = arm_command_pb2.ArmVelocityCommand.Request(
             cartesian_velocity=cartesian_velocity,
             end_time=self._robot.time_sync.robot_timestamp_from_local_secs(time.time() +
                                                                            VELOCITY_CMD_DURATION))
 
-        cmd_id = self._arm_velocity_cmd_helper(arm_velocity_command=arm_velocity_command, desc=desc)
+        self._arm_velocity_cmd_helper(arm_velocity_command=arm_velocity_command, desc=desc)
 
 
     def _arm_cylindrical_velocity_cmd_helper(self, desc='', v_r=0.0, v_theta=0.0, v_z=0.0):
@@ -1013,7 +726,7 @@ class WasdInterface(object):
 
         """
         # Build the linear velocity command specified in a cylindrical coordinate system
-        cylindrical_velocity = arm_command_pb2.ArmVelocityCommand.CylindricalVelocity()
+        cylindrical_velocity = arm_command_pb2.ArmVelocityCommand.CylindricalVelocity(frame_name = "body")
         cylindrical_velocity.linear_velocity.r = v_r
         cylindrical_velocity.linear_velocity.theta = v_theta
         cylindrical_velocity.linear_velocity.z = v_z
@@ -1023,34 +736,7 @@ class WasdInterface(object):
             end_time=self._robot.time_sync.robot_timestamp_from_local_secs(time.time() +
                                                                            VELOCITY_CMD_DURATION))
 
-        cmd_id = self._arm_velocity_cmd_helper(arm_velocity_command=arm_velocity_command, desc=desc)
-
-        block_until_arm_arrives(self._robot_command_client, cmd_id, 2.0)
-
-        state = self._robot_state_client.get_robot_state()
-        joint_state_dict = {}
-        for joint_state in state.kinematic_state.joint_states:
-            joint_state_dict[joint_state.name] = joint_state
-
-        # Build the proto for the trajectory point.
-        traj_point1 = RobotCommandBuilder.create_arm_joint_trajectory_point(
-            joint_state_dict['arm0.sh0'].position.value,joint_state_dict['arm0.sh1'].position.value
-            ,joint_state_dict['arm0.el0'].position.value,joint_state_dict['arm0.el1'].position.value
-            ,joint_state_dict['arm0.wr0'].position.value,joint_state_dict['arm0.wr1'].position.value, 1.0)
-
-        max_vel = wrappers_pb2.DoubleValue(value=2.5)
-        max_acc = wrappers_pb2.DoubleValue(value=15)
-
-        # Build up a proto.
-        arm_joint_traj = arm_command_pb2.ArmJointTrajectory(points=[traj_point1],
-                                                            maximum_velocity=max_vel,
-                                                            maximum_acceleration=max_acc)
-        # Make a RobotCommand
-        command = self.make_robot_command(arm_joint_traj)
-
-        # Send the request
-        #self._start_robot_command('move_arm_by_joint_angle', command)
-        
+        self._arm_velocity_cmd_helper(arm_velocity_command=arm_velocity_command, desc=desc)
 
     def _velocity_cmd_helper(self, desc='', v_x=0.0, v_y=0.0, v_rot=0.0):
         self._start_robot_command(
@@ -1068,33 +754,11 @@ class WasdInterface(object):
                                   end_time_secs=time.time() + VELOCITY_CMD_DURATION)
 
     def _stow(self):
-        #self._start_robot_command('open_gripper', RobotCommandBuilder.claw_gripper_open_command())
         self._start_robot_command('stow', RobotCommandBuilder.arm_stow_command())
         
 
     def _unstow(self):
         self._start_robot_command('stow', RobotCommandBuilder.arm_ready_command())
-
-    def _return_to_origin(self):
-        self._start_robot_command(
-            'fwd_and_rotate',
-            RobotCommandBuilder.synchro_se2_trajectory_point_command(
-                goal_x=0.0, goal_y=0.0, goal_heading=0.0, frame_name=ODOM_FRAME_NAME, params=None,
-                body_height=0.0, locomotion_hint=spot_command_pb2.HINT_SPEED_SELECT_TROT),
-            end_time_secs=time.time() + 20)
-
-    def _take_ascii_image(self):
-        source_name = 'frontright_fisheye_image'
-        image_response = self._image_client.get_image_from_sources([source_name])
-        image = Image.open(io.BytesIO(image_response[0].shot.image.data))
-        ascii_image = self._ascii_converter.convert_to_ascii(image, new_width=70)
-        self._last_image_ascii = ascii_image
-
-    def _toggle_ascii_video(self):
-        if self._video_mode:
-            self._video_mode = False
-        else:
-            self._video_mode = True
 
 
     def _toggle_power(self):
@@ -1204,38 +868,155 @@ class WasdInterface(object):
         fileHandlerLogger.addHandler(handler)
 
         return fileHandlerLogger
-    def _move_arm_position(self,x=0.3,y=0,z=-0.25,qw=1,qx=0,qy=0,qz=0):
-        # Make the arm pose RobotCommand
-        # Build a position to move the arm to (in meters, relative to and expressed in the gravity aligned body frame).
-        hand_ewrt_flat_body = geometry_pb2.Vec3(x=x, y=y, z=z)
 
-        # Rotation as a quaternion
-        flat_body_Q_hand = geometry_pb2.Quaternion(w=qw, x=qx, y=qy, z=qz)
+    def _on_mouse(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if self.grasp_position is None:
+                cv2.circle(self.image, (x, y), 10, (255, 0, 0), 5)
+                cv2.imshow('image', self.image)
+                self.grasp_position = (x, y)
+                print((x,y))
 
-        flat_body_T_hand = geometry_pb2.SE3Pose(position=hand_ewrt_flat_body,
-                                                rotation=flat_body_Q_hand)
 
-        robot_state = self._robot_state_client.get_robot_state()
-        odom_T_flat_body = get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
-                                         BODY_FRAME_NAME, HAND_FRAME_NAME)
+    def show_image_get_point(self,window_name='Show Captured Image'):
+        """Open window showing the side by side fisheye images with on-screen prompts for user."""
 
-        odom_T_hand = odom_T_flat_body * math_helpers.SE3Pose.from_proto(flat_body_T_hand)
+        u._draw_text_on_image(self.image, 'Click handle.')
+        cv2.imshow(window_name, self.image)
+        cv2.setMouseCallback(window_name, self._on_mouse)
 
-        # duration in seconds
-        seconds = 2
+        while self.grasp_position is None:
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == ord('Q'):
+                print('"q" pressed, exiting.')
+                cv2.destroyAllWindows()
+                break
+        print(
+            f'Picking object at image location ({self.grasp_position[0]}, {self.grasp_position[1]})')
 
-        arm_command = RobotCommandBuilder.arm_pose_command(
-            odom_T_hand.x, odom_T_hand.y, odom_T_hand.z, odom_T_hand.rot.w, odom_T_hand.rot.x,
-            odom_T_hand.rot.y, odom_T_hand.rot.z, BODY_FRAME_NAME, seconds)
+    def _show_image_grasp(self):
+        self.grasp_position = None
 
-        # Make the open gripper RobotCommand
-        #gripper_command = RobotCommandBuilder.claw_gripper_open_fraction_command(1.0)
+        image_res = self._image_client.get_image_from_sources(self.image_source)
+        for response in image_res:
+            if response.source.image_type == ImageSource.IMAGE_TYPE_VISUAL:
+                # Convert image proto to CV2 image, for display later.
+                image = np.frombuffer(response.shot.image.data, dtype=np.uint8)
+                image = cv2.imdecode(image, -1)
+                self.image = image
+                self.image_rep = response
+            else:
+                self.depth_image = response.shot.image.data
+        self.show_image_get_point()
+        pick_vec = geometry_pb2.Vec2(x=self.grasp_position[0], y=self.grasp_position[1])
+        # Build the proto
+        grasp = manipulation_api_pb2.PickObjectInImage(
+            pixel_xy=pick_vec,
+            transforms_snapshot_for_camera=self.image_rep.shot.transforms_snapshot,
+            frame_name_image_sensor=self.image_rep.shot.frame_name_image_sensor,
+            camera_model=self.image_rep.source.pinhole)
+        u.add_grasp_constraint(4, grasp, self._robot_state_client)
+        grasp_request = manipulation_api_pb2.ManipulationApiRequest(pick_object_in_image=grasp)
 
-        # Combine the arm and gripper commands into one RobotCommand
-        command = RobotCommandBuilder.build_synchro_command(arm_command)
-        #robot_command.synchronized_command.arm_command
         # Send the request
-        self._start_robot_command('move_arm',command)
+        cmd_response = self._robot_mani_client.manipulation_api_command(
+            manipulation_api_request=grasp_request)
+        while True:
+            feedback_request = manipulation_api_pb2.ManipulationApiFeedbackRequest(
+                manipulation_cmd_id=cmd_response.manipulation_cmd_id)
+
+            # Send the request
+            response = self._robot_mani_client.manipulation_api_feedback_command(
+                manipulation_api_feedback_request=feedback_request)
+
+            print(
+                f'Current state: {manipulation_api_pb2.ManipulationFeedbackState.Name(response.current_state)}'
+            )
+
+            if response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED or response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_FAILED:
+                break
+
+            time.sleep(0.25)
+
+
+
+    #in body frame
+    def _grasp_from_agent(self,):
+        self.grasp_position = None
+        image_res = self._image_client.get_image_from_sources(self.image_source)
+        for response in image_res:
+            if response.source.image_type == ImageSource.IMAGE_TYPE_VISUAL:
+                # Convert image proto to CV2 image, for display later.
+                image = np.frombuffer(response.shot.image.data, dtype=np.uint8)
+                image = cv2.imdecode(image, -1)
+                self.image = image
+            else:
+                self.depth_image = response.shot.image.data
+        rgb_image = cv2.cvtColor(self.image, cv2.COLOR_GRAY2RGB)
+        image_ten = torch.from_numpy(rgb_image)
+        feature = self.imgprocessor.encoder.feature_extract_single(image_ten)
+        mask = None
+        if afford:
+            self.show_image_get_point()
+            centroid=self.grasp_position
+            LOGGER.info(centroid)
+            mask = self.imgprocessor.segmentor.get_segment_single_promt(image_ten,centroid)
+
+
+
+        # # need refine
+
+        obs={
+            'policy':feature,
+            'mask':mask
+        }
+        action_x, action_y  =agent.select_action(obs)
+        self.grasp_from_image(x=action_x,y=action_y)
+        LOGGER.info(f'action_x is{action_x,action_y}')
+
+
+    def grasp_from_image(self,x=86,y=309):
+        image_res = self._image_client.get_image_from_sources(self.image_source)
+        for response in image_res:
+            if response.source.image_type == ImageSource.IMAGE_TYPE_VISUAL:
+                # Convert image proto to CV2 image, for display later.
+                image = np.frombuffer(response.shot.image.data, dtype=np.uint8)
+                image = cv2.imdecode(image, -1)
+                self.image = image
+                self.image_rep = response
+        pick_vec = geometry_pb2.Vec2(x=x, y=y)
+        # Build the proto
+        grasp = manipulation_api_pb2.PickObjectInImage(
+            pixel_xy=pick_vec,
+            transforms_snapshot_for_camera=self.image_rep.shot.transforms_snapshot,
+            frame_name_image_sensor=self.image_rep.shot.frame_name_image_sensor,
+            camera_model=self.image_rep.source.pinhole)
+        u.add_grasp_constraint(2, grasp, self._robot_state_client)
+        grasp_request = manipulation_api_pb2.ManipulationApiRequest(pick_object_in_image=grasp)
+
+        # Send the request
+        cmd_response = self._robot_mani_client.manipulation_api_command(
+            manipulation_api_request=grasp_request)
+        while True:
+            feedback_request = manipulation_api_pb2.ManipulationApiFeedbackRequest(
+                manipulation_cmd_id=cmd_response.manipulation_cmd_id)
+
+            # Send the request
+            response = self._robot_mani_client.manipulation_api_feedback_command(
+                manipulation_api_feedback_request=feedback_request)
+
+            LOGGER.info(
+                f'Current state: {manipulation_api_pb2.ManipulationFeedbackState.Name(response.current_state)}'
+            )
+
+            if response.current_state != manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED or response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_FAILED:
+                break
+
+            if response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED or response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_FAILED:
+                break
+
+
+
 
 def _setup_logging(verbose):
     """Log to file at debug level, and log to console at INFO or DEBUG (if verbose).
@@ -1246,7 +1027,7 @@ def _setup_logging(verbose):
     log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
     # Save log messages to file wasd.log for later debugging.
-    file_handler = logging.FileHandler('customized_remote_control.log')
+    file_handler = logging.FileHandler('control.log')
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(log_formatter)
     LOGGER.addHandler(file_handler)
@@ -1265,7 +1046,6 @@ def _setup_logging(verbose):
 
 
 
-
 def main():
     """Command-line interface."""
     import argparse
@@ -1276,13 +1056,13 @@ def main():
                         help='The interval (seconds) that time-sync estimate should be updated.',
                         type=float)
     options = parser.parse_args()
-
     stream_handler = _setup_logging(options.verbose)
+
 
 
     # Create robot object.
     sdk = create_standard_sdk('WASDClient')
-    robot = sdk.create_robot(options.hostname)
+    robot = sdk.create_robot('10.0.0.30')
     try:
         robot.authenticate('rllab', 'robotlearninglab')
         bosdyn.client.util.authenticate(robot)
@@ -1311,7 +1091,7 @@ def main():
             curses.wrapper(wasd_interface.drive)
         finally:
             # Restore stream handler to show any exceptions or final messages.
-            LOGGER.addHandler(stream_handler)
+            LOGGER.error('Failed to initialize robot communication')
     except Exception as e:
         LOGGER.error('WASD has thrown an error: [%r] %s', e, e, exc_info=True)
     finally:
