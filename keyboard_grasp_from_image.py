@@ -141,34 +141,7 @@ class AsyncRobotState(AsyncPeriodicQuery):
 
     def _start_query(self):
         return self._client.get_robot_state_async()
-class AsyncArmStateCapture(AsyncPeriodicQuery):
 
-    def __init__(self, robot_state_client):
-        super(AsyncArmStateCapture, self).__init__('robot_state', robot_state_client, LOGGER,
-                                              period_sec=0.0001)
-
-    def _start_query(self):
-        return self._client.get_robot_state_async()
-
-    def _should_query(self, now_sec):  # pylint: disable=unused-argument
-        return (now_sec - self._last_call) > self._period_sec
-
-    def _handle_result(self, result):
-        try:
-            #timestamp = result.kinematic_state.acquisition_timestamp.seconds + \
-            #            result.kinematic_state.acquisition_timestamp.nanos * 1e-9
-            timestamp = "%.20f" % time.time()
-
-            arm_filename = STATE_LOG_PATH + str(timestamp)+'.pkl'
-
-            with open(arm_filename, 'wb') as f:
-                pickle.dump(result, f)
-
-        except Exception as e:
-            LOGGER.exception('Error saving the image: %s', e)
-
-    def _handle_error(self, exception):
-        LOGGER.exception('Failure getting image: %s', exception)
 
 
 
@@ -192,11 +165,11 @@ class WasdInterface(object):
         self._robot_state_task = AsyncRobotState(self._robot_state_client)
         self._robot_command_client = robot.ensure_client(RobotCommandClient.default_service_name)
         self._robot_mani_client = robot.ensure_client(ManipulationApiClient.default_service_name)
-        self._arm_log_task = AsyncArmStateCapture(self._robot_state_client)
+
         #['frontright_fisheye_image', 'frontleft_fisheye_image', 'frontright_depth', 'frontleft_depth']
         self._image_client = robot.ensure_client(ImageClient.default_service_name)
         self._async_tasks = AsyncTasks([self._robot_state_task,
-                                        self._arm_log_task,
+                                        #self._arm_log_task,
                                         #self._image_task
                                         ])
 
@@ -847,7 +820,7 @@ class WasdInterface(object):
     def show_image_get_point(self,window_name='Show Captured Image'):
         """Open window showing the side by side fisheye images with on-screen prompts for user."""
 
-        u._draw_text_on_image(self.image, 'Click handle.')
+        u._draw_text_on_image(self.image, 'Click position.')
         cv2.imshow(window_name, self.image)
         cv2.setMouseCallback(window_name, self._on_mouse)
 

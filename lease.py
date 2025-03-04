@@ -10,12 +10,6 @@ bosdyn.client.util.authenticate(robot)
 
 # Create lease client
 lease_client = robot.ensure_client(LeaseClient.default_service_name)
-
-# List active leases
-#active_leases = lease_client.list_leases()
-#print("Active Leases:", active_leases)
-
-
 lease = lease_client.take()  # Or use lease_client.take() to forcefully claim it
 print(f"Acquired Lease: {lease}")
 lease_client.return_lease(lease)
