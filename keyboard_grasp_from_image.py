@@ -49,33 +49,17 @@ from bosdyn.api.image_pb2 import ImageSource
 from bosdyn.client.manipulation_api_client import ManipulationApiClient
 import torch
 import utils as u
-import ImageProcess as imgutil
 import cv2
 LOGGER = logging.getLogger(__name__)
 
-path = '/home/carol/Project/Spot/grasp_in_image/Spot-Reach-v0/102/reach'
-#/home/carol/Project/Spot/grasp_in_image/Spot-Reach-v0/102/reach_afford_new/final_ddqn.pth
-afford=True
-prior=True
-model='_new/final_ddqn.pth'
-if prior:
-    model ='_prior'+model
-if afford:
-    model = '_afford' + model
-load_path = path+model
-from DQN_play import DDQN
-agent = DDQN(
-    afford=afford,
-    prior=prior,
-)
-agent.load_model(path=load_path)
+
 
 
 # Logs name
 # datetime object containing current date and time
 # dd/mm/YY H:M:S
+base_path = os.getcwd()
 dt_string = datetime.now().strftime("%d-%m-%Y-%H-%M-%S")
-base_path = 'logs-aff/'+dt_string+'/'+model.split('/')[0]
 STATE_LOG_PATH=base_path+'/state/'
 os.makedirs(STATE_LOG_PATH, exist_ok=True)
 
@@ -186,17 +170,6 @@ class AsyncArmStateCapture(AsyncPeriodicQuery):
     def _handle_error(self, exception):
         LOGGER.exception('Failure getting image: %s', exception)
 
-class Image_Process():
-    """Grab camera images from the robot."""
-
-    def __init__(self, encode_flag=True,sgm_flag=True):
-        if encode_flag:
-            self.encoder = imgutil.DinoProcessor()
-        if sgm_flag:
-            self.segmentor = imgutil.SamProcessor()
-        self.encode_flag = encode_flag
-        self.sgm_flag = sgm_flag
-
 
 
 class WasdInterface(object):
@@ -228,11 +201,8 @@ class WasdInterface(object):
                                         ])
 
         self.image_source = ['frontright_fisheye_image']
-        depth_source = VISUAL_SOURCE_TO_DEPTH_MAP_SOURCE[self.image_source[0]]
-        self.image_source.append(depth_source)
         self.image=None
         self.grasp_position = None
-        self.imgprocessor=Image_Process(encode_flag=True,sgm_flag=True)
 
 
         self._lock = threading.Lock()
@@ -251,11 +221,9 @@ class WasdInterface(object):
             ord('M'): self._toggle_gripper_closed,
             ord('q'): self._turn_left,
             ord('e'): self._turn_right,
-            #ord('i'): self._toggle_image_capture,
             ord('y'): self._unstow,
             ord('h'): self._stow,
             ord('v'): self._show_image_grasp,
-            ord('k'): self._grasp_from_agent,
             ord('.'): self.reset_AI_CONTROL,
             
         }
@@ -381,9 +349,8 @@ class WasdInterface(object):
         stdscr.addstr(15, 0, '          [wasd]: Directional strafing                 ')
         stdscr.addstr(16, 0, '          [NM]: Open/Close gripper                  ')
         stdscr.addstr(17, 0, '          [qe]: Body Turning, [ESC]: Stop                   ')
-        stdscr.addstr(18, 0, '          [l]: Return/Acquire lease                  ')
-        stdscr.addstr(19, 0, '          [v],show mask of the image')
-        stdscr.addstr(20, 0, '          [m],detect the target and move to it automatically')
+        #stdscr.addstr(18, 0, '          [l]: Return/Acquire lease                  ')
+        stdscr.addstr(18, 0, '          [v],show image and wait for click')
 
 
         global AI_CONTROL
@@ -416,7 +383,6 @@ class WasdInterface(object):
         try:
             cmd_id = thunk()
             state = self._robot_state_client.get_robot_state
-            #self.robot_state_handler_logger.info(state)
             return cmd_id
         except (ResponseError, RpcError, LeaseBaseError) as err:
             self.add_message(f'Failed {desc}: {err}')
@@ -933,46 +899,13 @@ class WasdInterface(object):
                 f'Current state: {manipulation_api_pb2.ManipulationFeedbackState.Name(response.current_state)}'
             )
 
+            if response.current_state != manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED:
+                break
+
             if response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED or response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_FAILED:
                 break
 
             time.sleep(0.25)
-
-
-
-    #in body frame
-    def _grasp_from_agent(self,):
-        self.grasp_position = None
-        image_res = self._image_client.get_image_from_sources(self.image_source)
-        for response in image_res:
-            if response.source.image_type == ImageSource.IMAGE_TYPE_VISUAL:
-                # Convert image proto to CV2 image, for display later.
-                image = np.frombuffer(response.shot.image.data, dtype=np.uint8)
-                image = cv2.imdecode(image, -1)
-                self.image = image
-            else:
-                self.depth_image = response.shot.image.data
-        rgb_image = cv2.cvtColor(self.image, cv2.COLOR_GRAY2RGB)
-        image_ten = torch.from_numpy(rgb_image)
-        feature = self.imgprocessor.encoder.feature_extract_single(image_ten)
-        mask = None
-        if afford:
-            self.show_image_get_point()
-            centroid=self.grasp_position
-            LOGGER.info(centroid)
-            mask = self.imgprocessor.segmentor.get_segment_single_promt(image_ten,centroid)
-
-
-
-        # # need refine
-
-        obs={
-            'policy':feature,
-            'mask':mask
-        }
-        action_x, action_y  =agent.select_action(obs)
-        self.grasp_from_image(x=action_x,y=action_y)
-        LOGGER.info(f'action_x is{action_x,action_y}')
 
 
     def grasp_from_image(self,x=86,y=309):
@@ -1009,7 +942,7 @@ class WasdInterface(object):
                 f'Current state: {manipulation_api_pb2.ManipulationFeedbackState.Name(response.current_state)}'
             )
 
-            if response.current_state != manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED or response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_FAILED:
+            if response.current_state != manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED:
                 break
 
             if response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED or response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_FAILED:
